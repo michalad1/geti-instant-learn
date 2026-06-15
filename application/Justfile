@@ -192,7 +192,7 @@ test-image:
       sleep 5
     done
 
-    EXPECTED_TITLE="Geti Instant Learn"
+    EXPECTED_TITLE="Geti™ Instant Learn"
     echo "Checking HTML title..."
 
     HTML_CONTENT=$(no_proxy=localhost curl -sf $TEST_URL)
