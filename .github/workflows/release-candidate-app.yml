@@ -157,7 +157,7 @@ jobs:
     runs-on: ${{ github.repository_owner == 'open-edge-platform' && 'overflow' || 'ubuntu-latest' }}
     permissions:
       issues: write
-      pull-requests: read
+      pull-requests: write
     if: ${{ always() && !cancelled() }}
     steps:
       - name: Harden the runner (audit all outbound calls)
@@ -167,18 +167,8 @@ jobs:
 
       - name: Update release PR comment
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        env:
-          PR_NUMBER: ${{ needs.prepare-parameters.outputs.pr_number }}
-          AI_DEVICES: ${{ inputs.ai_devices }}
-          CONTAINER_REGISTRY: ${{ needs.prepare-parameters.outputs.container_registry }}
-          DISTRIB_RESULT: ${{ needs.distrib.result }}
-          HEAD_SHA: ${{ needs.prepare-parameters.outputs.head_sha }}
-          PUSH_IMAGES: ${{ inputs.push_images }}
-          RC_VERSION: ${{ needs.prepare-parameters.outputs.rc_version }}
-          RELEASE_VERSION: ${{ needs.prepare-parameters.outputs.release_version }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          SHA_IMAGE_TAG: ${{ needs.prepare-parameters.outputs.sha_image_tag }}
         with:
+          github-token: ${{ secrets.COMMENT_TOKEN != '' && secrets.COMMENT_TOKEN || github.token }}
           script: |
             const marker = '<!-- app-release-candidate -->';
             const prNumber = Number(process.env.PR_NUMBER);
@@ -230,3 +220,14 @@ jobs:
               issue_number: prNumber,
               body,
             });
+        env:
+          PR_NUMBER: ${{ needs.prepare-parameters.outputs.pr_number }}
+          AI_DEVICES: ${{ inputs.ai_devices }}
+          CONTAINER_REGISTRY: ${{ needs.prepare-parameters.outputs.container_registry }}
+          DISTRIB_RESULT: ${{ needs.distrib.result }}
+          HEAD_SHA: ${{ needs.prepare-parameters.outputs.head_sha }}
+          PUSH_IMAGES: ${{ inputs.push_images }}
+          RC_VERSION: ${{ needs.prepare-parameters.outputs.rc_version }}
+          RELEASE_VERSION: ${{ needs.prepare-parameters.outputs.release_version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA_IMAGE_TAG: ${{ needs.prepare-parameters.outputs.sha_image_tag }}
