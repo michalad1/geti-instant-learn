@@ -87,6 +87,17 @@ jobs:
               return;
             }
 
+            if (pullRequest.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+              core.setFailed(`Pull request #${prNumber} must come from a branch in this repository (forks are not allowed).`);
+              return;
+            }
+
+            const trustedAssociations = new Set(['MEMBER', 'OWNER', 'COLLABORATOR']);
+            if (!trustedAssociations.has(pullRequest.author_association)) {
+              core.setFailed(`Pull request #${prNumber} author is not trusted for privileged checkout.`);
+              return;
+            }
+
             core.setOutput('pr_number', String(pullRequest.number));
             core.setOutput('head_sha', pullRequest.head.sha);
 
