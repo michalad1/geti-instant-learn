@@ -3,62 +3,130 @@ name: Application Release
 on:
   push:
     tags:
-      - 'app/v*'
+      - 'app/v[0-9]+\.[0-9]+\.[0-9]+'
 
 permissions: {} # No permissions by default
 
 jobs:
-  build-parameters:
-    name: Prepare build parameters
+  prepare-promotion:
+    name: Resolve promotion source
     runs-on: ${{ github.repository_owner == 'open-edge-platform' && 'overflow' || 'ubuntu-latest' }}
     environment: 'prod'
     permissions:
       contents: read
+      issues: read
+      pull-requests: read
     timeout-minutes: 10
     outputs:
-      build_version: "${{ steps.build-version.outputs.version }}"
+      build_version: "${{ steps.resolve_release.outputs.build_version }}"
+      container_registry: "${{ steps.resolve_release.outputs.container_registry }}"
+      source_image_tag: "${{ steps.resolve_release.outputs.source_image_tag }}"
     steps:
       - name: Harden the runner (audit all outbound calls)
         uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
         with:
           egress-policy: audit
 
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Resolve release metadata
+        id: resolve_release
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
-          persist-credentials: false
+          script: |
+            const releaseTag = context.ref.replace('refs/tags/app/v', '');
+            const expectedTitle = `chore(main): release app ${releaseTag}`;
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed',
+              base: 'main',
+              per_page: 100,
+            });
+            const matchingPullRequests = pulls
+              .filter(pullRequest => pullRequest.title === expectedTitle && pullRequest.merged_at)
+              .sort((left, right) => Date.parse(right.merged_at) - Date.parse(left.merged_at));
 
-      - name: Validate tag matches VERSION
-        id: build-version
-        working-directory: application
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          TAG_BASE="${TAG#app/v}"
-          FILE_VERSION="$(cat VERSION | tr -d '\n\r')"
+            if (matchingPullRequests.length === 0) {
+              core.setFailed(`Could not find a merged release PR titled "${expectedTitle}".`);
+              return;
+            }
 
-          echo "::group::Build parameters"
-          echo "Tag name: $TAG"
-          echo "Tag base: $TAG_BASE"
-          echo "File version: $FILE_VERSION"
-          echo "::endgroup::"
+            const releasePullRequest = matchingPullRequests[0];
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: releasePullRequest.number,
+              per_page: 100,
+            });
+            const metadataComment = [...comments].reverse().find(comment =>
+              comment.body.includes('<!-- app-release-candidate -->') &&
+              comment.body.includes(`<!-- release-version: ${releaseTag} -->`) &&
+              comment.body.includes('<!-- rc-status: promotable -->')
+            );
 
-          if [[ "$TAG_BASE" != "$FILE_VERSION" ]]; then
-            echo "Error: Tag version '$TAG_BASE' does not match VERSION file '$FILE_VERSION'"
-            exit 1
-          fi
+            if (!metadataComment) {
+              core.setFailed(`Could not find a promotable RC comment on release PR #${releasePullRequest.number}.`);
+              return;
+            }
 
-          echo "version=$TAG_BASE" >> "$GITHUB_OUTPUT"
+            function extractMetadata(name) {
+              const match = metadataComment.body.match(new RegExp(`<!-- ${name}: (.+?) -->`));
+              return match ? match[1] : '';
+            }
 
-  distrib:
-    name: Build and publish docker images
-    needs: build-parameters
-    uses: ./.github/workflows/distrib.yml
+            const sourceImageTag = extractMetadata('source-image-tag');
+            const containerRegistry = extractMetadata('container-registry');
+
+            if (!sourceImageTag || !containerRegistry) {
+              core.setFailed('RC metadata comment is missing source image tag or container registry.');
+              return;
+            }
+
+            core.setOutput('build_version', releaseTag);
+            core.setOutput('container_registry', containerRegistry);
+            core.setOutput('source_image_tag', sourceImageTag);
+
+  promote-images:
+    name: Promote tested release candidate images
+    needs: prepare-promotion
+    runs-on: ${{ github.repository_owner == 'open-edge-platform' && 'overflow' || 'ubuntu-latest' }}
     permissions:
       contents: read
       packages: write # Permission to push packages to GHCR
       id-token: write # Permission to request OIDC token for signing images
-    with:
-      ai_devices: '["xpu"]'
-      build_version: ${{ needs.build-parameters.outputs.build_version }}
-      push_images: ${{ github.repository_owner == 'open-edge-platform' }}
+    strategy:
+      matrix:
+        ai-device: ["xpu"]
+    env:
+      BUILD_VERSION: ${{ needs.prepare-promotion.outputs.build_version }}
+      CONTAINER_REGISTRY: ${{ needs.prepare-promotion.outputs.container_registry }}
+      DEVICE: ${{ matrix.ai-device }}
+      SOURCE_IMAGE_TAG: ${{ needs.prepare-promotion.outputs.source_image_tag }}
+    steps:
+      - name: Harden the runner (audit all outbound calls)
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        with:
+          egress-policy: audit
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote image for ${{ matrix.ai-device }}
+        id: promote_image
+        run: |
+          IMAGE_REPOSITORY="${CONTAINER_REGISTRY}/instant-learn-${DEVICE}"
+          SOURCE_IMAGE="${IMAGE_REPOSITORY}:${SOURCE_IMAGE_TAG}"
+          TARGET_IMAGE="${IMAGE_REPOSITORY}:${BUILD_VERSION}"
+
+          echo "Promoting ${SOURCE_IMAGE} to ${TARGET_IMAGE}"
+          docker buildx imagetools inspect "${SOURCE_IMAGE}"
+          docker buildx imagetools create --tag "${TARGET_IMAGE}" "${SOURCE_IMAGE}"
+          echo "target_image=${TARGET_IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Sign image for ${{ matrix.ai-device }}
+        uses: open-edge-platform/geti-ci/actions/sign-image@e80098b3d180db37914f11ff6021f9fa34d0bb9f
+        with:
+          image-uri: ${{ steps.promote_image.outputs.target_image }}

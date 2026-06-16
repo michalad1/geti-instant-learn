@@ -1,78 +1,245 @@
 name: Application Release Candidate
 on:
-  push:
-    tags:
-      - 'app/v[0-9]+\.[0-9]+\.[0-9]+rc[0-9]+'
+  workflow_dispatch:
+    inputs:
+      release_pr_number:
+        description: "Release PR number created by release-please"
+        required: true
+        type: string
+      rc_number:
+        description: "Release candidate sequence number"
+        required: true
+        default: "1"
+        type: string
+      ai_devices:
+        description: "JSON array of devices"
+        required: false
+        default: '["xpu"]'
+        type: string
+      container_registry:
+        description: "Container registry for RC images"
+        required: false
+        default: ""
+        type: string
+      push_images:
+        description: "Push RC images to the registry"
+        required: false
+        default: true
+        type: boolean
 
 permissions: {} # No permissions by default
 
 jobs:
-  build-parameters:
-    name: Prepare build parameters
+  prepare-parameters:
+    name: Prepare release candidate parameters
     runs-on: ${{ github.repository_owner == 'open-edge-platform' && 'overflow' || 'ubuntu-latest' }}
     environment: 'prod'
     permissions:
       contents: read
+      pull-requests: read
     timeout-minutes: 10
     outputs:
-      build_version: "${{ steps.build-version.outputs.version }}"
+      pr_number: "${{ steps.resolve-pr.outputs.pr_number }}"
+      head_sha: "${{ steps.resolve-pr.outputs.head_sha }}"
+      release_version: "${{ steps.rc-parameters.outputs.release_version }}"
+      rc_version: "${{ steps.rc-parameters.outputs.rc_version }}"
+      sha_image_tag: "${{ steps.rc-parameters.outputs.sha_image_tag }}"
+      additional_tags: "${{ steps.rc-parameters.outputs.additional_tags }}"
+      container_registry: "${{ steps.rc-parameters.outputs.container_registry }}"
     steps:
       - name: Harden the runner (audit all outbound calls)
         uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
         with:
           egress-policy: audit
 
-      - name: Checkout code
+      - name: Resolve release PR
+        id: resolve-pr
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RELEASE_PR_NUMBER: ${{ inputs.release_pr_number }}
+        with:
+          script: |
+            const prNumber = Number(process.env.RELEASE_PR_NUMBER);
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+              core.setFailed('release_pr_number must be a positive integer.');
+              return;
+            }
+
+            const response = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            const pullRequest = response.data;
+            if (pullRequest.state !== 'open') {
+              core.setFailed(`Pull request #${prNumber} is not open.`);
+              return;
+            }
+
+            if (pullRequest.base.ref !== 'main') {
+              core.setFailed(`Pull request #${prNumber} must target main.`);
+              return;
+            }
+
+            if (!pullRequest.title.includes('release app ')) {
+              core.setFailed(`Pull request #${prNumber} does not look like an application release PR.`);
+              return;
+            }
+
+            if (pullRequest.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+              core.setFailed(`Pull request #${prNumber} must come from a branch in this repository (forks are not allowed).`);
+              return;
+            }
+
+            const trustedAssociations = new Set(['MEMBER', 'OWNER', 'COLLABORATOR']);
+            if (!trustedAssociations.has(pullRequest.author_association)) {
+              core.setFailed(`Pull request #${prNumber} author is not trusted for privileged checkout.`);
+              return;
+            }
+
+            core.setOutput('pr_number', String(pullRequest.number));
+            core.setOutput('head_sha', pullRequest.head.sha);
+
+      - name: Checkout release PR head
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ steps.resolve-pr.outputs.head_sha }}
           persist-credentials: false
 
-      - name: Validate tag matches VERSION
-        id: build-version
-        working-directory: application
+      - name: Compute release candidate parameters
+        id: rc-parameters
         env:
-          TAG: ${{ github.ref_name }}
+          HEAD_SHA: ${{ steps.resolve-pr.outputs.head_sha }}
+          RC_NUMBER_INPUT: ${{ inputs.rc_number }}
+          PR_NUMBER: ${{ steps.resolve-pr.outputs.pr_number }}
+          INPUT_CONTAINER_REGISTRY: ${{ inputs.container_registry }}
         run: |
-          TAG_BASE="${TAG#app/v}"
-          TAG_VERSION="${TAG_BASE%rc*}"
-          FILE_VERSION="$(cat VERSION | tr -d '\n\r')"
-
-          echo "::group::Build parameters"
-          echo "Tag name: $TAG"
-          echo "Tag base: $TAG_BASE"
-          echo "Tag version: $TAG_VERSION"
-          echo "File version: $FILE_VERSION"
-          echo "::endgroup::"
-
-          if [[ "$TAG_VERSION" != "$FILE_VERSION" ]]; then
-            echo "Error: Tag version '$TAG_VERSION' does not match VERSION file '$FILE_VERSION'"
+          if ! [[ "${RC_NUMBER_INPUT}" =~ ^[0-9]+$ ]]; then
+            echo "Error: rc_number must be a positive integer."
             exit 1
           fi
 
-          echo "version=$TAG_BASE" >> "$GITHUB_OUTPUT"
+          RELEASE_VERSION="$(tr -d '\n\r' < application/VERSION)"
+          RC_VERSION="${RELEASE_VERSION}rc${RC_NUMBER_INPUT}"
+          SHA_IMAGE_TAG="sha-${HEAD_SHA}"
+
+          if [[ -n "${INPUT_CONTAINER_REGISTRY}" ]]; then
+            CONTAINER_REGISTRY="${INPUT_CONTAINER_REGISTRY}"
+          elif [[ "${GITHUB_REPOSITORY_OWNER}" == "open-edge-platform" ]]; then
+            CONTAINER_REGISTRY="ghcr.io/open-edge-platform"
+          else
+            CONTAINER_REGISTRY="ghcr.io/${GITHUB_REPOSITORY_OWNER}"
+          fi
+
+          echo "::group::Build parameters"
+          echo "Release PR number: ${PR_NUMBER}"
+          echo "Release PR head SHA: ${HEAD_SHA}"
+          echo "Release version: ${RELEASE_VERSION}"
+          echo "RC version: ${RC_VERSION}"
+          echo "SHA image tag: ${SHA_IMAGE_TAG}"
+          echo "Container registry: ${CONTAINER_REGISTRY}"
+          echo "::endgroup::"
+
+          echo "release_version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "rc_version=${RC_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha_image_tag=${SHA_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          printf 'additional_tags=["%s"]\n' "${SHA_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "container_registry=${CONTAINER_REGISTRY}" >> "$GITHUB_OUTPUT"
 
   distrib:
-    name: Build and publish docker images
-    needs: build-parameters
+    name: Build and publish RC docker images
+    needs: prepare-parameters
     uses: ./.github/workflows/distrib.yml
     permissions:
       contents: read
       packages: write # Permission to push packages to GHCR
       id-token: write # Permission to request OIDC token for signing images
     with:
-      ai_devices: '["xpu"]'
-      build_version: ${{ needs.build-parameters.outputs.build_version }}
-      push_images: true
+      ai_devices: ${{ inputs.ai_devices }}
+      build_version: ${{ needs.prepare-parameters.outputs.rc_version }}
+      container_registry: ${{ needs.prepare-parameters.outputs.container_registry }}
+      push_images: ${{ inputs.push_images }}
+      sha-commit: ${{ needs.prepare-parameters.outputs.head_sha }}
+      additional_tags: ${{ needs.prepare-parameters.outputs.additional_tags }}
 
-  windows-installer:
-    name: Build Windows installer
-    needs: build-parameters
-    uses: ./.github/workflows/windows-installer.yml
+  result-output:
+    name: Report RC result to release PR
+    needs: [prepare-parameters, distrib]
+    runs-on: ${{ github.repository_owner == 'open-edge-platform' && 'overflow' || 'ubuntu-latest' }}
     permissions:
-      contents: read
-    secrets:
-      MSIX_SIGN_CERTIFICATE: ${{ secrets.MSIX_SIGN_CERTIFICATE }}
-      MSIX_SIGN_CERTIFICATE_PASSWORD: ${{ secrets.MSIX_SIGN_CERTIFICATE_PASSWORD }}
-    with:
-      build_version: ${{ needs.build-parameters.outputs.build_version }}
-      device: xpu
+      issues: write
+      pull-requests: write
+    if: ${{ always() && !cancelled() }}
+    steps:
+      - name: Harden the runner (audit all outbound calls)
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        with:
+          egress-policy: audit
+
+      - name: Update release PR comment
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ secrets.COMMENT_TOKEN != '' && secrets.COMMENT_TOKEN || github.token }}
+          script: |
+            const marker = '<!-- app-release-candidate -->';
+            const prNumber = Number(process.env.PR_NUMBER);
+            const rcSucceeded = process.env.DISTRIB_RESULT === 'success';
+            const promotable = rcSucceeded && process.env.PUSH_IMAGES === 'true';
+            const devices = JSON.parse(process.env.AI_DEVICES);
+            const rcTags = devices
+              .map(device => `- \`${process.env.CONTAINER_REGISTRY}/instant-learn-${device}:${process.env.RC_VERSION}\``)
+              .join('\n');
+            const shaTags = devices
+              .map(device => `- \`${process.env.CONTAINER_REGISTRY}/instant-learn-${device}:${process.env.SHA_IMAGE_TAG}\``)
+              .join('\n');
+
+            const metadata = [
+              marker,
+              `<!-- container-registry: ${process.env.CONTAINER_REGISTRY} -->`,
+              `<!-- rc-status: ${promotable ? 'promotable' : rcSucceeded ? 'built-only' : 'failed'} -->`,
+              `<!-- release-version: ${process.env.RELEASE_VERSION} -->`,
+              `<!-- rc-version: ${process.env.RC_VERSION} -->`,
+              `<!-- source-image-tag: ${process.env.SHA_IMAGE_TAG} -->`,
+              `<!-- source-sha: ${process.env.HEAD_SHA} -->`,
+            ].join('\n');
+
+            const body = rcSucceeded
+              ? `${metadata}\n\n## Application release candidate\n\nRelease PR head SHA: \`${process.env.HEAD_SHA}\`\nRelease version: \`${process.env.RELEASE_VERSION}\`\nRC version: \`${process.env.RC_VERSION}\`\n\nRC image tags:\n${rcTags}\n\nSHA image tags:\n${shaTags}\n\nPromotable: **${promotable ? 'yes' : 'no'}**\n\n[View workflow run](${process.env.RUN_URL})`
+              : `${metadata}\n\n## Application release candidate\n\nRC build failed for release version \`${process.env.RELEASE_VERSION}\`.\n\n[View workflow run](${process.env.RUN_URL})`;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+            const existingComment = comments.find(comment => comment.body.includes(marker));
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body,
+              });
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body,
+            });
+        env:
+          PR_NUMBER: ${{ needs.prepare-parameters.outputs.pr_number }}
+          AI_DEVICES: ${{ inputs.ai_devices }}
+          CONTAINER_REGISTRY: ${{ needs.prepare-parameters.outputs.container_registry }}
+          DISTRIB_RESULT: ${{ needs.distrib.result }}
+          HEAD_SHA: ${{ needs.prepare-parameters.outputs.head_sha }}
+          PUSH_IMAGES: ${{ inputs.push_images }}
+          RC_VERSION: ${{ needs.prepare-parameters.outputs.rc_version }}
+          RELEASE_VERSION: ${{ needs.prepare-parameters.outputs.release_version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA_IMAGE_TAG: ${{ needs.prepare-parameters.outputs.sha_image_tag }}
