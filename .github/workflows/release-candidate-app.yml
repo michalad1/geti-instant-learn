@@ -112,6 +112,7 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.resolve-pr.outputs.head_sha }}
           RC_NUMBER_INPUT: ${{ inputs.rc_number }}
+          PR_NUMBER: ${{ steps.resolve-pr.outputs.pr_number }}
           INPUT_CONTAINER_REGISTRY: ${{ inputs.container_registry }}
         run: |
           if ! [[ "${RC_NUMBER_INPUT}" =~ ^[0-9]+$ ]]; then
@@ -132,7 +133,7 @@ jobs:
           fi
 
           echo "::group::Build parameters"
-          echo "Release PR number: ${{ steps.resolve-pr.outputs.pr_number }}"
+          echo "Release PR number: ${PR_NUMBER}"
           echo "Release PR head SHA: ${HEAD_SHA}"
           echo "Release version: ${RELEASE_VERSION}"
           echo "RC version: ${RC_VERSION}"
